@@ -1,0 +1,313 @@
+version: 2.1
+
+parameters:
+  GHA_Event:
+    type: string
+    default: ""
+  GHA_Actor:
+    type: string
+    default: ""
+  GHA_Action:
+    type: string
+    default: ""
+  GHA_Meta:
+    type: string
+    default: ""
+
+orbs:
+  flutter: circleci/flutter@1.0.1
+  android: circleci/android@1.0.3
+executors:
+  default-ios:
+    working_directory: ~/repo
+    macos:
+      xcode: 14.1.0
+
+commands:
+  record-jks-key:
+    steps:
+      - run:
+          name: Setup key.properties
+          command: |
+            echo "${ANDROID_KEY_PROPERTIES}" | base64 -di > ~/repo/android/key.properties
+      - run:
+          name: Setup key.jks
+          command: |
+            echo "${ANDROID_KEY_JKS}" | base64 -di > ~/repo/android/key.jks
+  record-google-api:
+    steps:
+      - run:
+          name: Setup horai_api_key.json
+          command: |
+            echo "${GOOGLE_API_JSON}" | base64 -di > ~/repo/android/horai_api_key.json
+  install-flutter:
+    steps:
+      - checkout
+      - run:
+          name: Set Flutter vesion
+          command: echo 'export FLUTTER_VERSION="3.3.9"' >> $BASH_ENV
+      - flutter/install_sdk_and_pub:
+          flutter_version: ${FLUTTER_VERSION}
+      - run: flutter pub run build_runner build --delete-conflicting-outputs
+  install-ruby-dependencies:
+    steps:
+      - restore_cache:
+          key: 1-gems-{{ checksum "ios/Gemfile.lock" }}
+      - run:
+          name: Bundle check
+          command: cd ~/repo/ios && bundle check || bundle install --path vendor/bundle
+      - save_cache:
+          name: Save cache
+          key: 1-gems-{{ checksum "ios/Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+  install-android-ruby-dependencies:
+    steps:
+      - restore_cache:
+          key: 1-gems-{{ checksum "android/Gemfile.lock" }}
+      - run:
+          name: Bundle check
+          command: cd ~/repo/android && bundle check || bundle install --path vendor/bundle
+      - save_cache:
+          name: Save cache
+          key: 1-gems-{{ checksum "android/Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+  set-ios-environment:
+    steps:
+      - run:
+          name: Setup Environment Variables
+          command: |
+            echo 'export PATH="$PATH:/Users/distiller/flutter/bin"' >> $BASH_ENV
+            echo 'export FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD=$FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD' >> $BASH_ENV
+            echo 'export FASTLANE_PASSWORD=$FASTLANE_PASSWORD' >> $BASH_ENV
+            echo 'export MATCH_PASSWORD=$MATCH_PASSWORD' >> $BASH_ENV
+            echo 'export TEMP_KEYCHAIN_USER=$TEMP_KEYCHAIN_USER' >> $BASH_ENV
+            echo 'export TEMP_KEYCHAIN_PASSWORD=$TEMP_KEYCHAIN_PASSWORD' >> $BASH_ENV
+            echo 'export APP_STORE_CONNECT_API_KEY_ISSUER_ID=$APP_STORE_CONNECT_API_KEY_ISSUER_ID' >> $BASH_ENV
+            echo 'export APP_STORE_CONNECT_API_KEY_KEY=$APP_STORE_CONNECT_API_KEY_KEY' >> $BASH_ENV
+            echo 'export APP_STORE_CONNECT_API_KEY_KEY_ID=$APP_STORE_CONNECT_API_KEY_KEY_ID' >> $BASH_ENV
+  build-android:
+    parameters:
+      env:
+        type: string
+    steps:
+      - run: echo "${ANDROID_KEY_PROPERTIES}" | base64 --decode > android/key.properties
+      - run: echo "${ANDROID_KEY_JKS}" | base64 --decode > android/app/key.jks
+      - run: bash scripts/build.sh << parameters.env >> android
+      - store_artifacts:
+          path: ~/repo/build/app/outputs/flutter-apk/app-develop-debug.apk
+
+  run-ios-fastlane:
+    parameters:
+      env:
+        type: string
+    steps:
+      - run:
+          name: Fastlane run
+          command: cd ~/repo/ios && bundle exec fastlane << parameters.env >>
+  dart_format:
+    steps:
+      - run:
+          name: Check dart format
+          command: |
+            flutter format --set-exit-if-changed -o none lib
+  dart_analyze:
+    steps:
+      - run:
+          name: Check analyze
+          command: |
+            flutter analyze || exit
+jobs:
+  setup-and-format:
+    working_directory: ~/repo
+    executor:
+      name: android/android-machine
+    steps:
+      - checkout
+      - install-flutter
+      - dart_format
+      - dart_analyze
+      - run: flutter test --no-sound-null-safety
+
+  build-android:
+    working_directory: ~/repo
+    executor:
+      name: android/android-machine
+    steps:
+      - checkout
+      - install-flutter
+      - record-jks-key
+      - run: bash scripts/build.sh develop android
+      - store_artifacts:
+          path: ~/repo/build/app/outputs/flutter-apk/app-develop-debug.apk
+          destination: android.apk
+
+  app-distribution-android:
+    working_directory: ~/repo
+    executor:
+      name: android/android-machine
+    steps:
+      - checkout
+      - record-jks-key
+      - install-flutter
+      - install-android-ruby-dependencies
+      - run: cd ~/repo/android && bundle exec fastlane deploy_develop_to_firebase
+
+  app-distribution-ios:
+    working_directory: ~/repo
+    executor:
+      name: default-ios
+    steps:
+      - checkout
+      - install-flutter
+      - install-ruby-dependencies
+      - run: cd ~/repo/ios && bundle exec fastlane deploy_dev_to_firebase
+
+  build-android-staging:
+    working_directory: ~/repo
+    executor:
+      name: android/android-machine
+    steps:
+      - checkout
+      - record-jks-key
+      - install-flutter
+      - run: bash scripts/build.sh staging android
+      - store_artifacts:
+          path: ~/repo/build/app/outputs/flutter-apk/app-profile.apk
+          destination: horai-android-staging.apk
+
+  upload-android-staging:
+    working_directory: ~/repo
+    executor:
+      name: android/android-machine
+    steps:
+      - checkout
+      - record-jks-key
+      - install-flutter
+      - install-android-ruby-dependencies
+      - run: cd ~/repo/android && bundle exec fastlane deploy_to_firebase
+
+  build-upload-android-release:
+    working_directory: ~/repo
+    executor:
+      name: android/android-machine
+    steps:
+      - checkout
+      - record-jks-key
+      - record-google-api
+      - install-flutter
+      - flutter/install_android_gem
+      - run:
+          command: bundle exec fastlane deploy_to_google_play
+          working_directory: android
+      - store_artifacts:
+          path: ~/repo/build/app/outputs/flutter-apk/app-production-release.apk
+          destination: horai.apk
+
+  build-ios:
+    executor: default-ios
+    steps:
+      - checkout
+      - install-flutter
+      - run: bash scripts/build.sh develop ios
+      - run: cd build/ios/iphoneos && zip -r ios.ipa Runner.app
+      - store_artifacts:
+          path: ~/repo/build/ios/iphoneos/ios.ipa
+          destination: ios.ipa
+      - run: ls -la ~/repo/build/ios
+      - store_artifacts:
+          path: ~/repo/build/ios/iphoneos/Runner.app
+          destination: ios.app
+
+  upload-ios-staging:
+    executor: default-ios
+    steps:
+      - checkout
+      - set-ios-environment
+      - install-flutter
+      - install-ruby-dependencies
+      - run-ios-fastlane:
+          env: "upload_ios_staging"
+      - store_artifacts:
+          path: ~/repo/ios/Runner.app.dSYM.zip
+          destination: Runner.app.dSYM.zip
+
+  upload-ios-release:
+    executor: default-ios
+    steps:
+      - checkout
+      - set-ios-environment
+      - install-flutter
+      - install-ruby-dependencies
+      - run-ios-fastlane:
+          env: "upload_ios_release"
+      - store_artifacts:
+          path: ~/repo/ios/Runner.app.dSYM.zip
+          destination: Runner.app.dSYM.zip
+
+workflows:
+  version: 2
+
+  development-phase:
+    jobs:
+      - setup-and-format:
+          filters:
+            branches:
+              ignore:
+                - /pre-release\/.*/
+                - /release\/.*/
+
+      - build-android:
+          context: horai-frontend
+          requires:
+            - setup-and-format
+      - app-distribution-approval:
+          type: approval
+          requires:
+            - setup-and-format
+      - app-distribution-ios:
+          context: horai-frontend
+          requires:
+            - app-distribution-approval
+      - app-distribution-android:
+          context: horai-frontend
+          requires:
+            - app-distribution-approval
+
+  staging-flow:
+    jobs:
+      - upload-android-staging:
+          context: horai-frontend
+          filters:
+            branches:
+              only: /pre-release\/.*/
+      - upload-ios-staging:
+          context: horai-frontend
+          filters:
+            branches:
+              only: /pre-release\/.*/
+  release-flow:
+    when:
+      equal: [ "release", << pipeline.parameters.GHA_Action >>]
+    jobs:
+      - upload-ios-release:
+          context: horai-frontend
+          filters:
+            branches:
+              only: /release\/.*/
+      - build-upload-android-release:
+          context: horai-frontend
+          filters:
+            branches:
+              only: /release\/.*/
+
+  # daily-build:
+  #   triggers:
+  #     - schedule:
+  #         cron: '0 19 * * *'
+  #         filters:
+  #           branches:
+  #             only:
+  #               - master
